@@ -1,0 +1,1 @@
+smth_wrong = "nigga refer to the help command, u did smth wrong"
