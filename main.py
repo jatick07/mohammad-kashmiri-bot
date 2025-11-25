@@ -1,7 +1,6 @@
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import discord
-import logging
 import os
 import sqlite3
 import lang
@@ -15,10 +14,35 @@ token = os.getenv("TOKEN")
 db = sqlite3.connect('database.db')
 cursor = db.cursor()
 
-handler = logging.FileHandler(filename='bot.log', encoding='utf-8', mode='w')
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = commands.Bot(intents=intents, command_prefix='$')
+
+
+class Peasant(commands.Cog):
+    def __init__(self, client):
+        self.client = client
+        print("Loaded Peasant commands")
+
+    @commands.command(name='schedule')
+    async def schedule(self, ctx):
+        "- show schedule and availability of interview spots"
+        
+        cursor.execute(f"SELECT * FROM schedule WHERE guild_id = {ctx.guild.id}")
+        schedule = cursor.fetchall()
+
+        if not schedule:
+            await ctx.reply(f"No times available in the schedule, contact HR")
+        
+        out = ""
+        for row in schedule:
+            user = await client.fetch_user(row[3])
+            print(row[3])
+            out += f"- {row[1]} {row[2]} - *{user.name}*\n"
+        
+        await ctx.reply(out)
+
 
 class Admin(commands.Cog):
     def __init__(self, client):
@@ -27,16 +51,31 @@ class Admin(commands.Cog):
 
     @commands.command(name='sethr')
     @commands.has_permissions(administrator=True)
-    async def sethr(self, ctx, role: discord.Role):
+    async def sethr(self, ctx, role: discord.Role, channel: discord.TextChannel):
         "- sets the HR role that can adjust the schedule"
-
-        if not role:
-            await ctx.reply("nigga u didnt specify a role")
+        if not role or not channel:
+            await ctx.reply(lang.smth_wrong)
             return
-
-        cursor.execute(f"UPDATE role SET role_name = '{role.name}', role_id = '{role.id}'")
+        
+        
+        cursor.execute("INSERT INTO role (guild_id, role_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET role_id = excluded.role_id", (ctx.guild.id, role.id))
+        cursor.execute("INSERT INTO channel (guild_id, hr) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET hr = excluded.hr", (ctx.guild.id, channel.id))
         db.commit()
-        await ctx.reply(f"set <@&{role.id}> as the HR role")
+        
+        await ctx.reply(f"set <@&{role.id}> as the HR role, and <#{channel.id}> as the HR channel")
+
+    @commands.command(name='setwelcome')
+    @commands.has_permissions(administrator=True)
+    async def setwelcome(self, ctx, channel: discord.TextChannel):
+        "- sets the welcome channel"
+        if not channel:
+            await ctx.reply("nigga u didnt specify a channel")
+            return
+        
+        cursor.execute("INSERT INTO channel (guild_id, welcome) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET welcome = excluded.welcome", (ctx.guild.id, channel.id))
+        db.commit()
+        
+        await ctx.reply(f"set <#{channel.id}> as the welcome channel")
 
 
 class HR(commands.Cog):
@@ -48,7 +87,7 @@ class HR(commands.Cog):
     async def addtime(self, ctx, date, time, ampm, user: discord.Member):
         "- add time to schedule, for example: $addtime 28/12/2007 3:00 PM @nigga"
 
-        cursor.execute(f"SELECT * FROM role LIMIT 1;")
+        cursor.execute(f"SELECT * FROM role WHERE guild_id = {ctx.guild.id};")
         role_id = cursor.fetchone()[1]
         if role_id == 'default':
             return await ctx.reply("no role is set to run this command, run $sethr first")
@@ -62,27 +101,21 @@ class HR(commands.Cog):
         if not date_format or not time_format:
             return await ctx.reply(lang.smth_wrong)
             
-        cursor.execute(f"INSERT INTO schedule VALUES ('{date}', '{time}', {user.id})")
+        cursor.execute(f"INSERT INTO schedule VALUES ({ctx.guild.id}, '{date}', '{time}', {user.id})")
         db.commit()
 
-        return await ctx.send(f"added interview time for <@{user.id}> `{date} {time}`")
+        return await ctx.send(f"added interview time for <@{user.id}> on `{date}` at `{time}`")
 
 def initialize_database(db, cursor):
-    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{"role"}';")
-    role_table = cursor.fetchone()
-    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{"schedule"}';")
-    sched_table = cursor.fetchone()
-
-    if not role_table or not sched_table:
-        cursor.execute('CREATE TABLE role (role_name TEXT, role_id TEXT)')
-        cursor.execute("INSERT INTO role (role_name, role_id) VALUES ('default', 'default')")
-        cursor.execute('CREATE TABLE schedule (date TEXT, time TEXT, user INTEGER)')
-        db.commit()
+    cursor.execute('CREATE TABLE IF NOT EXISTS role (guild_id INTEGER PRIMARY KEY, role_id INTEGER)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS schedule (guild_id INTEGER, date TEXT, time TEXT, user INTEGER)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS channel (guild_id INTEGER PRIMARY KEY, welcome INTEGER, hr INTEGER)')
+    db.commit()
 
 
 @client.event
 async def on_ready():
-    await client.add_cog(Peasant(client, cursor, db))
+    await client.add_cog(Peasant(client))
     await client.add_cog(Admin(client))
     await client.add_cog(HR(client))
     initialize_database(db, cursor)
@@ -93,7 +126,9 @@ async def on_ready():
 
 @client.event
 async def on_member_join(member):
-    channel = client.get_channel(1442480252780806234) 
+    cursor.execute(f"SELECT * FROM channel WHERE guild_id = {member.guild.id}")
+    channel = client.get_channel(cursor.fetchone()[1])
+
     if channel:
         await channel.send(f"welcome ras el 3abed {member.mention}")
 
@@ -101,19 +136,20 @@ async def on_member_join(member):
 async def check_schedule(client):
     now = datetime.datetime.now().strftime("%d/%m/%Y %I:%M %p")
 
-    cursor.execute("SELECT date, time, user FROM schedule")
+    cursor.execute("SELECT * FROM schedule")
     rows = cursor.fetchall()
 
-    for date, time, user_id in rows:
+    for guild_id, date, time, user_id in rows:
         scheduled_str = f"{date} {'0' if time[1] == ':' else ''}{time}"
         print(scheduled_str + ", now: " + now)
         if scheduled_str == now:
-            # RUN YOUR ACTION HERE
-            channel = client.get_channel(1442479992318722089)
+            cursor.execute(f"SELECT * FROM channel WHERE guild_id = {guild_id}")
+            channel = client.get_channel(cursor.fetchone()[2])
+
             await channel.send(f"nigga its `{scheduled_str}` its time for fukin interview <@{user_id}> get ur ass here ")
             cursor.execute(
-                "DELETE FROM schedule WHERE date = ? AND time = ?",
-                (date, time)
+                "DELETE FROM schedule WHERE date = ? AND time = ? AND user = ?",
+                (date, time, user_id)
             )
             db.commit()
 
